@@ -1,0 +1,197 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "url": "https://track.delhivery.com/api/v1/packages/json/",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "waybill",
+              "value": "={{ $json['Comma Seperate AWBs'] }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Token fc5469d400d46b448354415402db0885a8221f59"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "27e48f95-4812-4ef7-8b15-441ad4e46a94",
+      "name": "Delhivery Tracking API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        288,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "formTitle": "AWBs",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Comma Seperate AWBs"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.5,
+      "position": [
+        64,
+        0
+      ],
+      "id": "0724e234-2883-4de9-beb9-047b7eef4f15",
+      "name": "On form submission",
+      "webhookId": "3e555c11-fdc4-4f90-9ec3-1ac72be8acdb"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst result = [];\n\nfunction formatCustomDate(dateStr) {\n  if (!dateStr) return \"\";\n  const d = new Date(dateStr);\n  const months = [\"Jan\", \"Feb\", \"Mar\", \"Apr\", \"May\", \"Jun\", \"Jul\", \"Aug\", \"Sep\", \"Oct\", \"Nov\", \"Dec\"];\n  const day = d.getDate();\n  const month = months[d.getMonth()];\n  const year = d.getFullYear();\n  let hours = d.getHours();\n  let minutes = d.getMinutes();\n  const ampm = hours >= 12 ? 'pm' : 'am';\n  hours = hours % 12;\n  hours = hours ? hours : 12; \n  const paddedHours = hours < 10 ? '0' + hours : hours;\n  const paddedMinutes = minutes < 10 ? '0' + minutes : minutes;\n  return `${day} ${month} ${year}, ${paddedHours}:${paddedMinutes} ${ampm}`;\n}\n\nfor (const item of items) {\n  const data = item.json;\n  let shipmentDataList = [];\n  \n  // Identify where ShipmentData lives\n  if (data.ShipmentData) {\n    shipmentDataList = data.ShipmentData;\n  } else if (Array.isArray(data) && data[0] && data[0].ShipmentData) {\n    shipmentDataList = data[0].ShipmentData;\n  } else {\n    shipmentDataList = data;\n  }\n\n  for (const shipmentWrapper of shipmentDataList) {\n    const shipment = shipmentWrapper.Shipment;\n    if (!shipment) continue;\n    \n    let journeyText = \"\";\n    if (shipment.Scans && shipment.Scans.length > 0) {\n      for (const scanObj of shipment.Scans) {\n        const scan = scanObj.ScanDetail;\n        const formattedDate = formatCustomDate(scan.ScanDateTime);\n        journeyText += `${formattedDate}\\n${scan.Instructions} at ${scan.ScannedLocation}\\n\\n`;\n      }\n    } else {\n      journeyText = \"No journey scans available.\";\n    }\n\n    result.push({\n      json: {\n        \"AWB\": shipment.AWB || \"\",\n        \"Status\": shipment.Status?.Status || \"\",\n        \"Status Details\": shipment.Status?.Instructions || \"\",\n        \"Consignee\": shipment.Consignee?.Name || \"\",\n        \"Delivery Date\": shipment.DeliveryDate ? formatCustomDate(shipment.DeliveryDate) : \"Pending\",\n        \"Journey\": journeyText.trim()\n      }\n    });\n  }\n}\nreturn result;"
+      },
+      "id": "e6f9d270-4e31-41db-b27b-e98e27c12431",
+      "name": "Format Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": {}
+      },
+      "id": "673cf0cc-00ad-44b4-8db9-b7b2ce8f4951",
+      "name": "Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.3,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "toFile",
+        "fileFormat": "xlsx",
+        "options": {
+          "fileName": "Shipment_Tracking_Report.xlsx"
+        }
+      },
+      "id": "7dc2d3e4-cf62-42da-aa91-31fbb7efb2c0",
+      "name": "Spreadsheet File",
+      "type": "n8n-nodes-base.spreadsheetFile",
+      "typeVersion": 2,
+      "position": [
+        940,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "team@example.com",
+        "subject": "Delhivery Tracking Report",
+        "message": "Please find the attached tracking report generated by n8n.",
+        "appendAttribution": false,
+        "options": {
+          "attachments": "data"
+        }
+      },
+      "id": "18f9df0b-222f-48d0-ad17-21bb0db4be7c",
+      "name": "Gmail",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1160,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Delhivery Tracking API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delhivery Tracking API": {
+      "main": [
+        [
+          {
+            "node": "Format Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Data": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Spreadsheet File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Spreadsheet File": {
+      "main": [
+        [
+          {
+            "node": "Gmail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8bc950d3900a0e713d309f3ebad424914d2394dff27af3c2339fd0ab5cfababf"
+  }
+}

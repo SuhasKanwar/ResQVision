@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
@@ -196,17 +196,22 @@ def download_hursat(storms_df):
         logging.info(f"Not in archive: {not_in_archive[:10]}{'...' if len(not_in_archive) > 10 else ''}")
 
 def _parse_one_nc(filepath):
+    # Extract timestamp from filename — zero file I/O, avoids HDF5 thread issues.
+    # Real HURSAT filename: {storm_id}.{sub}.{YYYY}.{MM}.{DD}.{HHMM}.*.hursat-b1.v06.nc
     try:
-        with xr.open_dataset(filepath) as ds:
-            if 'IRWIN' not in ds:
-                return None
-            return {
-                'filepath': str(filepath),
-                'storm_id': Path(filepath).parent.name,
-                'timestamp': pd.to_datetime(ds.time.values[0]),
-                'satellite': ds.attrs.get('satellite', ds.attrs.get('satid', 'UNKNOWN')),
-                'image_shape': ds['IRWIN'].shape
-            }
+        parts = Path(filepath).stem.split('.')
+        # parts[2]=YYYY, [3]=MM, [4]=DD, [5]=HHMM
+        ts = pd.Timestamp(
+            year=int(parts[2]), month=int(parts[3]), day=int(parts[4]),
+            hour=int(parts[5][:2]), minute=int(parts[5][2:])
+        )
+        return {
+            'filepath': str(filepath),
+            'storm_id': Path(filepath).parent.name,
+            'timestamp': ts,
+            'satellite': 'HURSAT-B1',
+            'image_shape': (1, 301, 301)
+        }
     except Exception as e:
         logging.warning(f"Failed to parse {filepath}: {e}")
         return None
@@ -266,7 +271,7 @@ def match_timestamps(ibtracs_df, hursat_df):
 def _process_one_image(row, target_shape=(128, 128)):
     try:
         with xr.open_dataset(row['filepath']) as ds:
-            img_array = ds['IRWIN'].values[0]
+            img_array = ds['IRWIN'].values[0]  # dim: (htime, lat, lon)
             img_min, img_max = np.nanmin(img_array), np.nanmax(img_array)
             img_norm = ((img_array - img_min) / (img_max - img_min)).astype(np.float32) \
                 if img_max > img_min else np.zeros_like(img_array, dtype=np.float32)
@@ -285,7 +290,8 @@ def preprocess_images(matched_df):
     rows = [row._asdict() for row in matched_df.itertuples(index=False)]
     records = []
 
-    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+    # ProcessPoolExecutor avoids HDF5 global lock that serialises ThreadPoolExecutor
+    with ProcessPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(_process_one_image, row): row for row in rows}
         for future in tqdm(as_completed(futures), total=len(futures), desc="Processing images"):
             result = future.result()
