@@ -1,8 +1,12 @@
 import os
+import re
+import io
+import tarfile
 import pandas as pd
 import numpy as np
 import xarray as xr
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
@@ -19,7 +23,12 @@ INTERIM_DIR = DATA_DIR / "interim"
 PROC_IMAGES_DIR = DATA_DIR / "processed" / "images"
 PROC_SEQ_DIR = DATA_DIR / "processed" / "sequences"
 
-MAX_STORMS_TO_DOWNLOAD = None  
+MAX_STORMS_TO_DOWNLOAD = None
+
+HURSAT_BASE_URL = "https://www.ncei.noaa.gov/data/hurricane-satellite-hursat-b1/archive/v06"
+HURSAT_MIN_YEAR = 1978  # HURSAT-B1 v6 coverage starts 1978
+HURSAT_MAX_YEAR = 2015  # HURSAT-B1 v6 coverage ends 2015
+DOWNLOAD_WORKERS = 16   # parallel connections for listings + downloads
 
 def create_dirs():
     for d in [RAW_IBTRACS_DIR, RAW_HURSAT_DIR, INTERIM_DIR, PROC_IMAGES_DIR, PROC_SEQ_DIR]:
@@ -90,69 +99,141 @@ def clean_ibtracs(file_path):
     logging.info(f"Cleaned IBTrACS saved to {clean_path}")
     return df
 
+def _fetch_year_storm_map(year):
+    """Fetch HURSAT year listing. Returns (year, {storm_id: tar_filename}, base_url)."""
+    url = f"{HURSAT_BASE_URL}/{year}/"
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            entries = re.findall(r'href="(HURSAT_b1_v06_([^_]+)_[^"]+\.tar\.gz)"', resp.text)
+            return year, {sid: fname for fname, sid in entries}, url
+    except requests.RequestException:
+        pass
+    return year, {}, url
+
+def _download_and_extract(tar_url, storm_dir):
+    """Download a HURSAT storm tar.gz and extract all .nc files into storm_dir."""
+    resp = requests.get(tar_url, timeout=300)
+    resp.raise_for_status()
+    with tarfile.open(fileobj=io.BytesIO(resp.content), mode='r:gz') as tar:
+        for member in tar.getmembers():
+            if member.name.endswith('.nc'):
+                member.name = Path(member.name).name
+                tar.extract(member, path=storm_dir)
+
 def download_hursat(storms_df):
-    logging.info("Downloading/Mocking HURSAT data...")
-    unique_storms = storms_df['storm_id'].unique()
-    
+    logging.info("Downloading HURSAT-B1 data from NCEI (coverage: 1978–2015)...")
+
+    df = storms_df.copy()
+    df['year'] = pd.to_datetime(df['timestamp']).dt.year
+    df = df[(df['year'] >= HURSAT_MIN_YEAR) & (df['year'] <= HURSAT_MAX_YEAR)]
+
+    if df.empty:
+        logging.warning(
+            "No NI basin storms found within HURSAT-B1 coverage (up to 2015). "
+            "IBTrACS data exists but all storms fall outside the satellite archive range."
+        )
+        return
+
+    unique_storms = df['storm_id'].unique()
     if MAX_STORMS_TO_DOWNLOAD is not None:
         unique_storms = unique_storms[-MAX_STORMS_TO_DOWNLOAD:]
-        logging.info(f"Limiting to {MAX_STORMS_TO_DOWNLOAD} storms for demonstration.")
+        logging.info(f"Limiting to {MAX_STORMS_TO_DOWNLOAD} storms.")
 
-    storms_to_process = storms_df[storms_df['storm_id'].isin(unique_storms)]
-    
-    for _, row in tqdm(storms_to_process.iterrows(), total=len(storms_to_process), desc="Generating HURSAT Data"):
-        storm_id = row['storm_id']
-        year = row['timestamp'].year
-        dt_str = row['timestamp'].strftime('%Y%m%d%H')
-        
-        storm_dir = RAW_HURSAT_DIR / str(year) / storm_id
-        storm_dir.mkdir(parents=True, exist_ok=True)
-        
-        filepath = storm_dir / f"hursat_v6_{storm_id}_{dt_str}.nc"
-        
-        if not filepath.exists():
-            mock_data = np.random.rand(1, 150, 150).astype(np.float32)
-            ds = xr.Dataset(
-                {
-                    "IRWIN": (["time", "lat", "lon"], mock_data)
-                },
-                coords={
-                    "time": [row['timestamp']],
-                    "lat": np.linspace(row['latitude']-5, row['latitude']+5, 150),
-                    "lon": np.linspace(row['longitude']-5, row['longitude']+5, 150)
-                },
-                attrs={
-                    "storm_name": row['storm_name'],
-                    "satellite": "MockSat-1"
-                }
-            )
-            ds.to_netcdf(filepath)
-            ds.close()
+    storm_year = {sid: int(df[df['storm_id'] == sid]['year'].iloc[0]) for sid in unique_storms}
+
+    # Skip storms whose directories already have .nc files
+    storms_to_fetch = [
+        sid for sid in unique_storms
+        if not list((RAW_HURSAT_DIR / str(storm_year[sid]) / sid).glob('*.nc'))
+    ]
+    already_done = len(unique_storms) - len(storms_to_fetch)
+    if already_done:
+        logging.info(f"Skipping {already_done} storms already on disk.")
+    if not storms_to_fetch:
+        logging.info("All HURSAT-B1 data already on disk.")
+        return
+
+    # Phase 1: fetch one listing per year (much fewer requests than per-storm)
+    years_needed = sorted({storm_year[sid] for sid in storms_to_fetch})
+    logging.info(f"Fetching listings for {len(years_needed)} years...")
+    year_maps, year_urls = {}, {}
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        for year, storm_map, base_url in pool.map(_fetch_year_storm_map, years_needed):
+            year_maps[year] = storm_map
+            year_urls[year] = base_url
+
+    # Phase 2: match IBTrACS SIDs to HURSAT tar.gz filenames
+    download_tasks = []
+    not_in_archive = []
+    for sid in storms_to_fetch:
+        year = storm_year[sid]
+        tar_fname = year_maps.get(year, {}).get(sid)
+        if tar_fname:
+            storm_dir = RAW_HURSAT_DIR / str(year) / sid
+            storm_dir.mkdir(parents=True, exist_ok=True)
+            download_tasks.append((year_urls[year] + tar_fname, storm_dir))
+        else:
+            not_in_archive.append(sid)
+
+    logging.info(f"Matched {len(download_tasks)} storms, {len(not_in_archive)} not in archive.")
+
+    # Phase 3: download + extract tar.gz files in parallel
+    downloaded, errors = 0, 0
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = {pool.submit(_download_and_extract, url, d): d for url, d in download_tasks}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Downloading & extracting"):
+            storm_dir = futures[future]
+            try:
+                future.result()
+                downloaded += 1
+            except Exception as e:
+                errors += 1
+                logging.warning(f"Failed {storm_dir.name}: {e}")
+
+    logging.info(f"HURSAT-B1 complete: {downloaded} storms extracted, {errors} errors, {len(not_in_archive)} not in archive.")
+    if not_in_archive:
+        logging.info(f"Not in archive: {not_in_archive[:10]}{'...' if len(not_in_archive) > 10 else ''}")
+
+def _parse_one_nc(filepath):
+    try:
+        with xr.open_dataset(filepath) as ds:
+            if 'IRWIN' not in ds:
+                return None
+            return {
+                'filepath': str(filepath),
+                'storm_id': Path(filepath).parent.name,
+                'timestamp': pd.to_datetime(ds.time.values[0]),
+                'satellite': ds.attrs.get('satellite', ds.attrs.get('satid', 'UNKNOWN')),
+                'image_shape': ds['IRWIN'].shape
+            }
+    except Exception as e:
+        logging.warning(f"Failed to parse {filepath}: {e}")
+        return None
 
 def parse_hursat_metadata():
     logging.info("Parsing HURSAT metadata...")
+    # Only scan directories within the HURSAT coverage window to skip old mock files
+    nc_files = [
+        fp for fp in RAW_HURSAT_DIR.rglob('*.nc')
+        if fp.parent.parent.name.isdigit()
+        and HURSAT_MIN_YEAR <= int(fp.parent.parent.name) <= HURSAT_MAX_YEAR
+    ]
+    logging.info(f"Found {len(nc_files)} .nc files within {HURSAT_MIN_YEAR}–{HURSAT_MAX_YEAR}.")
     records = []
-    
-    nc_files = list(RAW_HURSAT_DIR.rglob('*.nc'))
-    for filepath in tqdm(nc_files, desc="Parsing metadata"):
-        try:
-            with xr.open_dataset(filepath) as ds:
-                time_val = pd.to_datetime(ds.time.values[0])
-                records.append({
-                    'filepath': str(filepath),
-                    'storm_name': ds.attrs.get('storm_name', 'UNKNOWN'),
-                    'timestamp': time_val,
-                    'satellite': ds.attrs.get('satellite', 'UNKNOWN'),
-                    'image_shape': ds.IRWIN.shape
-                })
-        except Exception as e:
-            logging.warning(f"Failed to parse {filepath}: {e}")
-            
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = {pool.submit(_parse_one_nc, fp): fp for fp in nc_files}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Parsing metadata"):
+            result = future.result()
+            if result:
+                records.append(result)
+
     df = pd.DataFrame(records)
     if not df.empty:
         metadata_path = INTERIM_DIR / "hursat_metadata.csv"
         df.to_csv(metadata_path, index=False)
-        logging.info(f"Saved metadata to {metadata_path}")
+        logging.info(f"Saved metadata for {len(df)} files to {metadata_path}")
     return df
 
 def match_timestamps(ibtracs_df, hursat_df):
@@ -160,63 +241,58 @@ def match_timestamps(ibtracs_df, hursat_df):
     if hursat_df.empty:
         logging.error("No HURSAT data available to match.")
         return pd.DataFrame()
-        
-    i_df = ibtracs_df.sort_values('timestamp')
-    h_df = hursat_df.sort_values('timestamp')
-    
+
+    i_df = ibtracs_df.sort_values('timestamp').copy()
+    h_df = hursat_df[['storm_id', 'timestamp', 'filepath', 'satellite']].sort_values('timestamp').copy()
+
     i_df['timestamp'] = pd.to_datetime(i_df['timestamp']).astype('datetime64[ns]')
     h_df['timestamp'] = pd.to_datetime(h_df['timestamp']).astype('datetime64[ns]')
-    
+
     matched = pd.merge_asof(
-        i_df, 
-        h_df, 
-        on='timestamp', 
-        by='storm_name', 
-        direction='nearest', 
+        i_df,
+        h_df,
+        on='timestamp',
+        by='storm_id',
+        direction='nearest',
         tolerance=pd.Timedelta('3 hours')
     )
-    
+
     matched = matched.dropna(subset=['filepath']).copy()
     matched_path = INTERIM_DIR / "storm_time_matches.csv"
     matched.to_csv(matched_path, index=False)
     logging.info(f"Matched {len(matched)} records.")
     return matched
 
+def _process_one_image(row, target_shape=(128, 128)):
+    try:
+        with xr.open_dataset(row['filepath']) as ds:
+            img_array = ds['IRWIN'].values[0]
+            img_min, img_max = np.nanmin(img_array), np.nanmax(img_array)
+            img_norm = ((img_array - img_min) / (img_max - img_min)).astype(np.float32) \
+                if img_max > img_min else np.zeros_like(img_array, dtype=np.float32)
+            img_final = np.array(
+                Image.fromarray(img_norm).resize(target_shape, Image.Resampling.BILINEAR)
+            )
+            save_path = PROC_IMAGES_DIR / f"img_{row['storm_id']}_{row['timestamp'].strftime('%Y%m%d%H')}.npy"
+            np.save(save_path, img_final)
+            return {'storm_id': row['storm_id'], 'timestamp': row['timestamp'], 'processed_img_path': str(save_path)}
+    except Exception as e:
+        logging.warning(f"Error processing {row['filepath']}: {e}")
+        return None
+
 def preprocess_images(matched_df):
     logging.info("Preprocessing images...")
-    target_shape = (128, 128)
-    processed_records = []
-    
-    for idx, row in tqdm(matched_df.iterrows(), total=len(matched_df), desc="Processing images"):
-        fp = row['filepath']
-        try:
-            with xr.open_dataset(fp) as ds:
-                img_array = ds.IRWIN.values[0]
-                
-                img_min = np.nanmin(img_array)
-                img_max = np.nanmax(img_array)
-                if img_max > img_min:
-                    img_norm = (img_array - img_min) / (img_max - img_min)
-                else:
-                    img_norm = img_array
-                    
-                img_pil = Image.fromarray(img_norm)
-                img_resized = img_pil.resize(target_shape, Image.Resampling.BILINEAR)
-                img_final = np.array(img_resized)
-                
-                save_name = f"img_{row['storm_id']}_{row['timestamp'].strftime('%Y%m%d%H')}.npy"
-                save_path = PROC_IMAGES_DIR / save_name
-                np.save(save_path, img_final)
-                
-                processed_records.append({
-                    'storm_id': row['storm_id'],
-                    'timestamp': row['timestamp'],
-                    'processed_img_path': str(save_path)
-                })
-        except Exception as e:
-            logging.warning(f"Error processing {fp}: {e}")
-            
-    return pd.DataFrame(processed_records)
+    rows = [row._asdict() for row in matched_df.itertuples(index=False)]
+    records = []
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = {pool.submit(_process_one_image, row): row for row in rows}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing images"):
+            result = future.result()
+            if result:
+                records.append(result)
+
+    return pd.DataFrame(records)
 
 def build_sequences(matched_df, proc_df):
     logging.info("Building sequences...")

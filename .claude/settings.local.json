@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.ncei.noaa.gov)",
+      "WebFetch(domain:ams.confex.com)",
+      "Bash(\"venv\\\\Scripts\\\\python.exe\" scripts/01_data_collection.py)"
+    ]
+  }
+}
