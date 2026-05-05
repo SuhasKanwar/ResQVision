@@ -380,15 +380,15 @@ python scripts/09_compare.py
 
 ### 8.2 Test MAE — Haversine Distance (km)
 
+Evaluated on 706 sequences from ~34 held-out storms never seen during training.
+
 | Model | Test MAE | Median | P90 | RMSE |
 |---|---|---|---|---|
-| Tabular LSTM | — | — | — | — |
-| CNN + MLP | — | — | — | — |
-| CNN + LSTM | — | — | — | — |
-| ConvLSTM | — | — | — | — |
-| Transformer | — | — | — | — |
-
-*Run `python scripts/08_evaluate.py --model all --data_dir data --ckpt_dir checkpoints` to fill this table.*
+| Tabular LSTM | 41.32 km | 35.24 km | 83.04 km | 49.93 km |
+| CNN + MLP | 57.44 km | 51.94 km | 103.15 km | 66.63 km |
+| CNN + LSTM | 58.61 km | 55.99 km | 100.14 km | 66.99 km |
+| **ConvLSTM** | **39.65 km** | **33.76 km** | **74.61 km** | **48.16 km** |
+| Transformer | 41.11 km | 33.96 km | 80.61 km | 49.89 km |
 
 ### 8.3 Key Findings
 
@@ -419,11 +419,25 @@ Spatiotemporal joint processing > track-only > decoupled spatial+temporal proces
 |---|---|---|
 | CLIPER (statistical) | ~100–150 km | Operational baseline |
 | NWP (GFS/ECMWF) | ~80–120 km | Operational NWP |
-| Tabular LSTM (ours) | 47.75 km | This work |
-| CNN + MLP (ours) | 61.68 km | This work |
-| CNN + LSTM (ours) | 64.87 km | This work |
-| **ConvLSTM (ours)** | **45.86 km** | **This work — best** |
-| Transformer (ours) | 46.93 km | This work |
+| Tabular LSTM (ours) | 41.32 km (test) | This work |
+| CNN + MLP (ours) | 57.44 km (test) | This work |
+| CNN + LSTM (ours) | 58.61 km (test) | This work |
+| **ConvLSTM (ours)** | **39.65 km (test)** | **This work — best** |
+| Transformer (ours) | 41.11 km (test) | This work |
+
+**All five models outperform both CLIPER and NWP benchmarks by a significant margin at 6h lead time.**  
+The best model (ConvLSTM, 39.65 km) represents a **~51% reduction in MAE vs NWP (80 km)** and **~65% reduction vs CLIPER (115 km)**.
+
+### 8.5 Evaluation Figures
+
+| Figure | Description |
+|---|---|
+| `fig1_error_distributions.png` | Overlapping error density histograms for all 5 models |
+| `fig2_boxplot_comparison.png` | Side-by-side boxplots showing median, IQR and outliers |
+| `fig3_mae_bar.png` | Bar chart of test MAE with values labelled |
+| `fig4_storm_tracks.png` | 6 sample test storms: track line + prediction arrows from all models |
+| `fig5_nio_map.png` | NIO basin scatter map — true vs ConvLSTM predicted positions |
+| `fig6_pred_vs_true.png` | Predicted vs true Δlat scatter for all 5 models (2×3 grid) |
 
 The central claim for the IEEE paper: **fusing sequential IR imagery with meteorological track data via a CNN-LSTM architecture yields statistically significant improvements over track-only baselines for 6-hour NIO cyclone displacement prediction.**
 
